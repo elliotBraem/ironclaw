@@ -8,6 +8,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 use near_agent::{
     agent::Agent,
     channels::{ChannelManager, HttpChannel, TuiChannel},
+    cli::{Cli, Command, run_tool_command},
     config::Config,
     history::Store,
     llm::create_llm_provider,
@@ -15,27 +16,26 @@ use near_agent::{
     tools::ToolRegistry,
 };
 
-#[derive(Parser, Debug)]
-#[command(name = "near-agent")]
-#[command(about = "LLM-powered autonomous agent for the NEAR AI marketplace")]
-#[command(version)]
-struct Args {
-    /// Run in interactive CLI mode only (disable other channels)
-    #[arg(long)]
-    cli_only: bool,
-
-    /// Skip database connection (for testing)
-    #[arg(long)]
-    no_db: bool,
-
-    /// Configuration file path (optional, uses env vars by default)
-    #[arg(short, long)]
-    config: Option<std::path::PathBuf>,
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let cli = Cli::parse();
+
+    // Handle non-agent commands first (they don't need TUI/full setup)
+    match &cli.command {
+        Some(Command::Tool(tool_cmd)) => {
+            // Simple logging for CLI commands
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+                )
+                .init();
+
+            return run_tool_command(tool_cmd.clone()).await;
+        }
+        None | Some(Command::Run) => {
+            // Continue to run agent
+        }
+    }
 
     // Create TUI channel early so we can hook up logging
     // (channel is created but not started until agent.run())
@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Loaded configuration for agent: {}", config.agent.name);
 
     // Initialize database store (optional for testing)
-    let store = if args.no_db {
+    let store = if cli.no_db {
         tracing::warn!("Running without database connection");
         None
     } else {
@@ -98,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Add HTTP channel if configured and not CLI-only mode
-    if !args.cli_only {
+    if !cli.cli_only {
         if let Some(ref http_config) = config.channels.http {
             channels.add(Box::new(HttpChannel::new(http_config.clone())));
             tracing::info!(

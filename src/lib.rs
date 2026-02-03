@@ -40,6 +40,7 @@
 
 pub mod agent;
 pub mod channels;
+pub mod cli;
 pub mod config;
 pub mod context;
 pub mod error;
