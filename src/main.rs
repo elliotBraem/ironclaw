@@ -6,13 +6,14 @@ use clap::Parser;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use ironclaw::{
-    agent::{Agent, AgentDeps},
+    agent::{Agent, AgentDeps, SessionManager},
     channels::{
-        AppEvent, ChannelManager, HttpChannel, ReplChannel, TuiChannel,
+        AppEvent, ChannelManager, GatewayChannel, HttpChannel, ReplChannel, TuiChannel,
         wasm::{
             RegisteredEndpoint, SharedWasmChannel, WasmChannelLoader, WasmChannelRouter,
             WasmChannelRuntime, WasmChannelRuntimeConfig, WasmChannelServer,
         },
+        web::log_layer::{LogBroadcaster, WebLogLayer},
     },
     cli::{
         Cli, Command, run_mcp_command, run_memory_command, run_status_command, run_tool_command,
@@ -193,6 +194,10 @@ async fn main() -> anyhow::Result<()> {
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("ironclaw=info,tower_http=debug"));
 
+    // Create log broadcaster before tracing init so the WebLogLayer can capture all events.
+    // This gets wired to the gateway's /api/logs/events SSE endpoint later.
+    let log_broadcaster = Arc::new(LogBroadcaster::new());
+
     // Determine which mode to use: REPL, single message, or TUI
     let use_repl = cli.repl || cli.message.is_some();
 
@@ -202,6 +207,7 @@ async fn main() -> anyhow::Result<()> {
         tracing_subscriber::registry()
             .with(env_filter)
             .with(tracing_subscriber::fmt::layer().with_target(false))
+            .with(WebLogLayer::new(Arc::clone(&log_broadcaster)))
             .init();
 
         let repl = if let Some(ref msg) = cli.message {
@@ -226,6 +232,7 @@ async fn main() -> anyhow::Result<()> {
                     .with_target(false)
                     .with_level(true),
             )
+            .with(WebLogLayer::new(Arc::clone(&log_broadcaster)))
             .init();
 
         (Some(channel), Some(event_sender), None)
@@ -234,6 +241,7 @@ async fn main() -> anyhow::Result<()> {
         tracing_subscriber::registry()
             .with(env_filter)
             .with(tracing_subscriber::fmt::layer().with_target(false))
+            .with(WebLogLayer::new(Arc::clone(&log_broadcaster)))
             .init();
 
         (None, None, None)
@@ -752,8 +760,34 @@ async fn main() -> anyhow::Result<()> {
     // Create context manager (shared between job tools and agent)
     let context_manager = Arc::new(ContextManager::new(config.agent.max_parallel_jobs));
 
+    // Create session manager (shared between agent and web gateway)
+    let session_manager = Arc::new(SessionManager::new());
+
     // Register job tools
     tools.register_job_tools(Arc::clone(&context_manager));
+
+    // Add web gateway channel if configured
+    if let Some(ref gw_config) = config.channels.gateway {
+        let mut gw = GatewayChannel::new(gw_config.clone());
+        if let Some(ref ws) = workspace {
+            gw = gw.with_workspace(Arc::clone(ws));
+        }
+        gw = gw.with_context_manager(Arc::clone(&context_manager));
+        gw = gw.with_session_manager(Arc::clone(&session_manager));
+        gw = gw.with_log_broadcaster(Arc::clone(&log_broadcaster));
+        gw = gw.with_tool_registry(Arc::clone(&tools));
+        if let Some(ref ext_mgr) = extension_manager {
+            gw = gw.with_extension_manager(Arc::clone(ext_mgr));
+        }
+
+        tracing::info!(
+            "Web gateway enabled on {}:{}",
+            gw_config.host,
+            gw_config.port
+        );
+
+        channels.add(Box::new(gw));
+    }
 
     // Create and run the agent
     let deps = AgentDeps {
@@ -769,6 +803,7 @@ async fn main() -> anyhow::Result<()> {
         channels,
         Some(config.heartbeat.clone()),
         Some(context_manager),
+        Some(session_manager),
     );
 
     tracing::info!("Agent initialized, starting main loop...");

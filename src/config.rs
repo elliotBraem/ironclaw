@@ -333,6 +333,7 @@ fn default_session_path() -> PathBuf {
 pub struct ChannelsConfig {
     pub cli: CliConfig,
     pub http: Option<HttpConfig>,
+    pub gateway: Option<GatewayConfig>,
     /// Directory containing WASM channel modules (default: ~/.ironclaw/channels/).
     pub wasm_channels_dir: std::path::PathBuf,
     /// Whether WASM channels are enabled.
@@ -349,6 +350,16 @@ pub struct HttpConfig {
     pub host: String,
     pub port: u16,
     pub webhook_secret: Option<SecretString>,
+    pub user_id: String,
+}
+
+/// Web gateway configuration.
+#[derive(Debug, Clone)]
+pub struct GatewayConfig {
+    pub host: String,
+    pub port: u16,
+    /// Bearer token for authentication. Random hex generated at startup if unset.
+    pub auth_token: Option<String>,
     pub user_id: String,
 }
 
@@ -372,6 +383,27 @@ impl ChannelsConfig {
             None
         };
 
+        let gateway = if optional_env("GATEWAY_ENABLED")?
+            .map(|s| s.to_lowercase() == "true" || s == "1")
+            .unwrap_or(false)
+        {
+            Some(GatewayConfig {
+                host: optional_env("GATEWAY_HOST")?.unwrap_or_else(|| "127.0.0.1".to_string()),
+                port: optional_env("GATEWAY_PORT")?
+                    .map(|s| s.parse())
+                    .transpose()
+                    .map_err(|e| ConfigError::InvalidValue {
+                        key: "GATEWAY_PORT".to_string(),
+                        message: format!("must be a valid port number: {e}"),
+                    })?
+                    .unwrap_or(3000),
+                auth_token: optional_env("GATEWAY_AUTH_TOKEN")?,
+                user_id: optional_env("GATEWAY_USER_ID")?.unwrap_or_else(|| "default".to_string()),
+            })
+        } else {
+            None
+        };
+
         let cli_enabled = optional_env("CLI_ENABLED")?
             .map(|s| s.to_lowercase() != "false" && s != "0")
             .unwrap_or(true);
@@ -381,6 +413,7 @@ impl ChannelsConfig {
                 enabled: cli_enabled,
             },
             http,
+            gateway,
             wasm_channels_dir: optional_env("WASM_CHANNELS_DIR")?
                 .map(PathBuf::from)
                 .unwrap_or_else(default_channels_dir),

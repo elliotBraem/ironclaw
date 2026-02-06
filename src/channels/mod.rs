@@ -33,9 +33,11 @@ mod http;
 mod manager;
 mod repl;
 pub mod wasm;
+pub mod web;
 
 pub use channel::{Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate};
 pub use cli::{AppEvent, TuiChannel};
 pub use http::HttpChannel;
 pub use manager::ChannelManager;
 pub use repl::ReplChannel;
+pub use web::GatewayChannel;

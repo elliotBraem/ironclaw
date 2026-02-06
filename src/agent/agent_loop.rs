@@ -86,17 +86,20 @@ pub struct Agent {
 impl Agent {
     /// Create a new agent.
     ///
-    /// Optionally accepts a pre-created `ContextManager` for sharing with job tools.
-    /// If not provided, creates a new one.
+    /// Optionally accepts pre-created `ContextManager` and `SessionManager` for sharing
+    /// with external components (job tools, web gateway). Creates new ones if not provided.
     pub fn new(
         config: AgentConfig,
         deps: AgentDeps,
         channels: ChannelManager,
         heartbeat_config: Option<HeartbeatConfig>,
         context_manager: Option<Arc<ContextManager>>,
+        session_manager: Option<Arc<SessionManager>>,
     ) -> Self {
         let context_manager = context_manager
             .unwrap_or_else(|| Arc::new(ContextManager::new(config.max_parallel_jobs)));
+
+        let session_manager = session_manager.unwrap_or_else(|| Arc::new(SessionManager::new()));
 
         let scheduler = Arc::new(Scheduler::new(
             config.clone(),
@@ -114,7 +117,7 @@ impl Agent {
             context_manager,
             scheduler,
             router: Router::new(),
-            session_manager: Arc::new(SessionManager::new()),
+            session_manager,
             context_monitor: ContextMonitor::new(),
             heartbeat_config,
         }
