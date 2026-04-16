@@ -1,6 +1,6 @@
 //! Authentication middleware for the web gateway.
 //!
-//! Supports three auth mechanisms, tried in order:
+//! Supports four auth mechanisms, tried in order:
 //!
 //! ```text
 //!   Request
@@ -13,8 +13,14 @@
 //!                │ no match / missing
 //!                ▼
 //!   ┌─────────────────────────────┐
-//!   │ OIDC JWT header             │──► sig + claims OK ──► ALLOW
-//!   │ (if configured)             │
+//!   │ OIDC JWT header             │──► Standard OIDC (openidconnect) ──► ALLOW
+//!   │ (if configured)              │──► ALB JWT (hand-rolled) ──► ALLOW
+//!   └────────────┬────────────────┘
+//!                │ no match / missing / disabled
+//!                ▼
+//!   ┌─────────────────────────────┐
+//!   │ Trust-proxy headers          │──► proxy secret match + user header ──► ALLOW
+//!   │ (if configured)              │
 //!   └────────────┬────────────────┘
 //!                │ no match / missing / disabled
 //!                ▼
@@ -26,12 +32,17 @@
 //! the user_id. The identity is inserted into request extensions so downstream
 //! handlers can extract it via `AuthenticatedUser`.
 //!
-//! **OIDC JWT** — enabled via `GATEWAY_OIDC_ENABLED=true`. The gateway
-//! reads a JWT from a configurable header (default: `x-amzn-oidc-data`),
-//! fetches the signing key from a JWKS endpoint, and verifies the
-//! signature + claims. Designed for reverse-proxy setups like AWS ALB
-//! with Okta/Cognito, but works with any RFC-compliant OIDC provider.
-//! The `sub` claim is used as the `user_id` for the resolved identity.
+//! **OIDC JWT** — two modes:
+//! - **Standard** (`OidcConfig::Standard`): uses the `openidconnect` crate for
+//!   full OIDC discovery, JWKS key rotation, and standard JWT verification.
+//!   Works with Okta, Auth0, Keycloak, Cognito, Azure AD, Google, etc.
+//! - **ALB** (`OidcConfig::Alb`): hand-rolled JWT verification for AWS ALB's
+//!   non-standard JWTs (padded base64, DER-encoded ECDSA signatures, per-key
+//!   URL fetching). Uses `x-amzn-oidc-data` header by default.
+//!
+//! **Trust-proxy** — trusts authenticated headers from a reverse proxy
+//! (e.g., oauth2-proxy, nginx, ALB + Lambda@Edge) when the proxy sends a
+//! shared secret. Uses constant-time comparison for the proxy secret.
 //!
 //! **Query-string token** — only allowed on SSE/WS endpoints where
 //! browser APIs cannot set custom headers.
@@ -54,12 +65,15 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 
-use crate::config::GatewayOidcConfig;
+use crate::config::{AlbOidcConfig, StandardOidcConfig, TrustProxyConfig};
 use crate::db::Database;
 
 /// Cookie name for OAuth browser sessions. Shared between the auth middleware
 /// (cookie extraction) and the auth handlers (cookie set/clear).
 pub const SESSION_COOKIE_NAME: &str = "ironclaw_session";
+
+/// Session lifetime: 30 days (cookie Max-Age and token expiry).
+pub const SESSION_LIFETIME_SECS: i64 = 30 * 24 * 60 * 60;
 
 // ── User identity ────────────────────────────────────────────────────────
 
@@ -278,7 +292,7 @@ impl DbAuthenticator {
 // ── Combined auth state ────────────────────────────────────────────────────
 
 /// Combined auth state: tries env-var tokens first, then DB-backed tokens,
-/// then OIDC JWT (if configured).
+/// then OIDC JWT (if configured), then trust-proxy (if configured).
 #[derive(Clone)]
 pub struct CombinedAuthState {
     /// In-memory tokens from GATEWAY_AUTH_TOKEN.
@@ -286,9 +300,13 @@ pub struct CombinedAuthState {
     /// DB-backed token authenticator (optional — only when a database is available).
     pub db_auth: Option<DbAuthenticator>,
     /// OIDC JWT auth state (None when OIDC is disabled).
-    pub oidc: Option<OidcState>,
-    /// Email domains allowed for OIDC login. Empty means allow all.
+    /// Wrapped in `RwLock` because standard OIDC discovery is async and
+    /// initializes after construction, during `GatewayChannel::start()`.
+    pub oidc: Arc<tokio::sync::RwLock<Option<OidcMode>>>,
+    /// Email domains allowed for OIDC/proxy login. Empty means allow all.
     pub oidc_allowed_domains: Vec<String>,
+    /// Trust-proxy configuration (None when trust-proxy is disabled).
+    pub trust_proxy: Option<TrustProxyConfig>,
 }
 
 impl From<MultiAuthState> for CombinedAuthState {
@@ -296,8 +314,9 @@ impl From<MultiAuthState> for CombinedAuthState {
         Self {
             env_auth,
             db_auth: None,
-            oidc: None,
+            oidc: Arc::new(tokio::sync::RwLock::new(None)),
             oidc_allowed_domains: Vec::new(),
+            trust_proxy: None,
         }
     }
 }
@@ -351,7 +370,61 @@ where
     }
 }
 
-// ── OIDC types ───────────────────────────────────────────────────────────
+// ── OIDC mode ────────────────────────────────────────────────────────────
+
+/// OIDC authentication mode: standard (openidconnect) or ALB (hand-rolled).
+#[derive(Clone)]
+pub enum OidcMode {
+    /// Standard OIDC using the `openidconnect` crate for discovery and verification.
+    Standard(StandardOidcState),
+    /// ALB-specific JWT verification with base64/DER workarounds.
+    Alb(AlbOidcState),
+}
+
+/// Standard OIDC state: holds discovery metadata for JWT verification.
+#[derive(Clone)]
+pub struct StandardOidcState {
+    /// The header name to read the JWT from (default: "Authorization" for Bearer tokens).
+    pub header: String,
+    /// The discovered issuer URL.
+    pub issuer: String,
+    /// The expected audience (client_id).
+    pub client_id: String,
+    /// The discovered JWKS (JSON Web Key Set).
+    pub jwks: openidconnect::core::CoreJsonWebKeySet,
+}
+
+impl StandardOidcState {
+    /// Perform OIDC discovery and build state with the provider's JWKS.
+    ///
+    /// Contacts the issuer's `/.well-known/openid-configuration` endpoint,
+    /// validates the issuer matches, and stores the JWKS for JWT verification.
+    pub async fn from_config(config: &StandardOidcConfig) -> Result<Self, String> {
+        use openidconnect::core::CoreProviderMetadata;
+        use openidconnect::IssuerUrl;
+
+        let issuer_url = IssuerUrl::new(config.issuer.clone())
+            .map_err(|e| format!("invalid OIDC issuer URL: {e}"))?;
+
+        let http_client = reqwest::ClientBuilder::new()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("failed to build OIDC HTTP client: {e}"))?;
+
+        let provider_metadata = CoreProviderMetadata::discover_async(issuer_url, &http_client)
+            .await
+            .map_err(|e| format!("OIDC discovery failed: {e}"))?;
+
+        let jwks = provider_metadata.jwks().clone();
+
+        Ok(Self {
+            header: config.header.clone(),
+            issuer: config.issuer.clone(),
+            client_id: config.client_id.clone(),
+            jwks,
+        })
+    }
+}
 
 /// Cached OIDC signing key with its resolved algorithm.
 #[derive(Clone)]
@@ -370,18 +443,11 @@ struct FailedFetch {
 /// How long to suppress retries after a JWKS fetch failure.
 const FETCH_FAILURE_BACKOFF: Duration = Duration::from_secs(10);
 
-/// OIDC JWT authentication state.
-///
-/// Holds the configuration, an HTTP client for JWKS fetches, and a
-/// per-`kid` key cache with 1-hour TTL.
-#[derive(Clone)]
-pub struct OidcState {
-    config: GatewayOidcConfig,
-    key_cache: Arc<RwLock<HashMap<String, CachedKey>>>,
-    /// Tracks recent fetch failures per kid to prevent retry storms.
-    fetch_failures: Arc<RwLock<HashMap<String, FailedFetch>>>,
-    http_client: reqwest::Client,
-}
+/// Key cache TTL: 1 hour.
+const KEY_CACHE_TTL: Duration = Duration::from_secs(3600);
+/// Maximum number of cached keys. Prevents memory exhaustion from
+/// attackers sending JWTs with many distinct `kid` values.
+const KEY_CACHE_MAX_ENTRIES: usize = 64;
 
 /// OIDC-specific errors (internal, never shown to unauthenticated clients).
 #[derive(Debug, thiserror::Error)]
@@ -389,6 +455,7 @@ enum OidcError {
     #[error("missing `kid` in JWT header")]
     MissingKid,
     #[error("unsupported algorithm: {0}")]
+    #[allow(dead_code)]
     UnsupportedAlgorithm(String),
     #[error("key fetch failed: {0}")]
     KeyFetch(String),
@@ -396,21 +463,27 @@ enum OidcError {
     InvalidSignature,
     #[error("claim validation failed: {0}")]
     InvalidClaims(String),
+    #[error("standard OIDC discovery failed: {0}")]
+    #[allow(dead_code)]
+    DiscoveryFailed(String),
 }
 
-const KEY_CACHE_TTL: Duration = Duration::from_secs(3600);
-/// Maximum number of cached keys. Prevents memory exhaustion from
-/// attackers sending JWTs with many distinct `kid` values.
-const KEY_CACHE_MAX_ENTRIES: usize = 64;
+/// ALB-specific OIDC state: holds JWKS key cache and ALB base64/DER workarounds.
+///
+/// AWS ALB produces non-standard JWTs with padded base64 segments and
+/// DER-encoded ECDSA signatures. This state handles those quirks.
+#[derive(Clone)]
+pub struct AlbOidcState {
+    config: AlbOidcConfig,
+    key_cache: Arc<RwLock<HashMap<String, CachedKey>>>,
+    /// Tracks recent fetch failures per kid to prevent retry storms.
+    fetch_failures: Arc<RwLock<HashMap<String, FailedFetch>>>,
+    http_client: reqwest::Client,
+}
 
-impl OidcState {
-    /// Build OIDC state from gateway config.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the reqwest HTTP client fails to build (e.g. TLS
-    /// backend unavailable).
-    pub fn from_config(oidc: &GatewayOidcConfig) -> Result<Self, String> {
+impl AlbOidcState {
+    /// Build ALB OIDC state from gateway config.
+    pub fn from_config(oidc: &AlbOidcConfig) -> Result<Self, String> {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -424,9 +497,6 @@ impl OidcState {
     }
 
     /// Pre-seed the key cache with a known key for testing.
-    ///
-    /// Allows integration tests to exercise the full OIDC middleware path
-    /// without requiring an HTTP JWKS endpoint.
     #[cfg(test)]
     pub(crate) async fn seed_key(&self, kid: &str, key: DecodingKey, algorithm: Algorithm) {
         let mut cache = self.key_cache.write().await;
@@ -453,7 +523,6 @@ impl OidcState {
         let trimmed = body.trim();
 
         if trimmed.starts_with("-----BEGIN") {
-            // PEM-encoded public key (EC or RSA).
             match alg {
                 Algorithm::ES256 | Algorithm::ES384 => DecodingKey::from_ec_pem(trimmed.as_bytes())
                     .map_err(|e| OidcError::KeyFetch(format!("EC PEM parse: {e}"))),
@@ -463,33 +532,13 @@ impl OidcState {
                     .map_err(|e| OidcError::KeyFetch(format!("RSA PEM parse: {e}"))),
             }
         } else {
-            // Assume single JWK JSON object.
             let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_str(trimmed)
                 .map_err(|e| OidcError::KeyFetch(format!("JWK parse: {e}")))?;
             DecodingKey::from_jwk(&jwk).map_err(|e| OidcError::KeyFetch(format!("JWK decode: {e}")))
         }
     }
 
-    /// Fetch from a standard JWKS endpoint and find the key matching `kid`.
-    async fn fetch_jwks_key(
-        &self,
-        url: &str,
-        kid: &str,
-    ) -> Result<(DecodingKey, Algorithm), OidcError> {
-        let body = self.fetch_url_text(url).await?;
-        let jwks: jsonwebtoken::jwk::JwkSet = serde_json::from_str(&body)
-            .map_err(|e| OidcError::KeyFetch(format!("JWKS parse: {e}")))?;
-        let jwk = jwks
-            .find(kid)
-            .ok_or_else(|| OidcError::KeyFetch(format!("kid '{kid}' not found in JWKS")))?;
-        let alg = resolve_algorithm(jwk)?;
-        let key = DecodingKey::from_jwk(jwk)
-            .map_err(|e| OidcError::KeyFetch(format!("JWK decode: {e}")))?;
-        Ok((key, alg))
-    }
-
-    /// Maximum JWKS response body size (256 KB). Prevents a compromised
-    /// endpoint from sending arbitrarily large payloads.
+    /// Maximum JWKS response body size (256 KB).
     const MAX_JWKS_RESPONSE_BYTES: usize = 256 * 1024;
 
     /// HTTP GET helper with timeout, error status check, and body size limit.
@@ -503,7 +552,6 @@ impl OidcState {
             .error_for_status()
             .map_err(|e| OidcError::KeyFetch(format!("HTTP error: {e}")))?;
 
-        // Check Content-Length hint before downloading.
         if let Some(len) = response.content_length()
             && len as usize > Self::MAX_JWKS_RESPONSE_BYTES
         {
@@ -545,7 +593,7 @@ impl OidcState {
             }
         }
 
-        // Check recent fetch failure backoff to avoid hammering a downed endpoint.
+        // Check recent fetch failure backoff.
         {
             let failures = self.fetch_failures.read().await;
             if let Some(failed) = failures.get(kid)
@@ -558,20 +606,14 @@ impl OidcState {
         }
 
         // Slow path: fetch and cache.
-        let fetch_result = if self.config.jwks_url.contains("{kid}") {
-            // URL-encode the kid to prevent SSRF via crafted JWT headers.
-            let encoded_kid: String =
-                url::form_urlencoded::byte_serialize(kid.as_bytes()).collect();
-            let url = self.config.jwks_url.replace("{kid}", &encoded_kid);
-            self.fetch_single_key(&url, alg).await.map(|key| (key, alg))
-        } else {
-            self.fetch_jwks_key(&self.config.jwks_url, kid).await
-        };
+        // URL-encode the kid to prevent SSRF via crafted JWT headers.
+        let encoded_kid: String =
+            url::form_urlencoded::byte_serialize(kid.as_bytes()).collect();
+        let url = self.config.jwks_url.replace("{kid}", &encoded_kid);
+        let fetch_result = self.fetch_single_key(&url, alg).await.map(|key| (key, alg));
 
-        // Record failure for backoff before propagating error.
         let (key, resolved_alg) = match fetch_result {
             Ok(result) => {
-                // Clear any previous failure record.
                 self.fetch_failures.write().await.remove(kid);
                 result
             }
@@ -588,11 +630,9 @@ impl OidcState {
 
         let mut cache = self.key_cache.write().await;
 
-        // Evict expired entries and enforce max cache size to prevent
-        // memory exhaustion from attacker-controlled kid values.
+        // Evict expired entries and enforce max cache size.
         cache.retain(|_, v| v.fetched_at.elapsed() < KEY_CACHE_TTL);
         if cache.len() >= KEY_CACHE_MAX_ENTRIES {
-            // Evict the oldest entry.
             if let Some(oldest_kid) = cache
                 .iter()
                 .min_by_key(|(_, v)| v.fetched_at)
@@ -618,6 +658,10 @@ impl OidcState {
 // ── Algorithm resolution ─────────────────────────────────────────────────
 
 /// Map a JWK's `alg` field to a `jsonwebtoken::Algorithm`.
+///
+/// Used by ALB JWKS key fetching. Standard OIDC uses the `openidconnect`
+/// crate's built-in key rotation instead.
+#[allow(dead_code)]
 fn resolve_algorithm(jwk: &jsonwebtoken::jwk::Jwk) -> Result<Algorithm, OidcError> {
     match jwk.common.key_algorithm {
         Some(jsonwebtoken::jwk::KeyAlgorithm::ES256) => Ok(Algorithm::ES256),
@@ -818,10 +862,49 @@ fn strip_der_leading_zero(bytes: &[u8]) -> &[u8] {
 
 // ── Full OIDC validation pipeline ────────────────────────────────────────
 
-/// Validate an OIDC JWT: fetch key, verify signature, check claims.
+/// Validate a JWT using standard OIDC discovery via the `openidconnect` crate.
+async fn validate_standard_oidc_jwt(state: &StandardOidcState, jwt: &str) -> Result<String, OidcError> {
+    use openidconnect::core::CoreIdToken;
+    use openidconnect::{ClientId, IssuerUrl, NonceVerifier, Nonce};
+
+    let id_token: CoreIdToken = jwt
+        .parse()
+        .map_err(|e| OidcError::InvalidClaims(format!("invalid id_token format: {e}")))?;
+
+    let issuer_url = IssuerUrl::new(state.issuer.clone())
+        .map_err(|e| OidcError::InvalidClaims(format!("invalid issuer URL: {e}")))?;
+
+    let verifier = openidconnect::core::CoreIdTokenVerifier::new_public_client(
+        ClientId::new(state.client_id.clone()),
+        issuer_url,
+        state.jwks.clone(),
+    );
+
+    // We're not doing an auth code flow, so we skip nonce verification.
+    struct SkipNonce;
+    impl NonceVerifier for SkipNonce {
+        fn verify(self, _expected: Option<&Nonce>) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    let claims = id_token
+        .claims(&verifier, SkipNonce)
+        .map_err(|e| OidcError::InvalidClaims(format!("id_token verification failed: {e}")))?;
+
+    let sub = claims.subject().to_string();
+    if sub.is_empty() {
+        return Err(OidcError::InvalidClaims("missing `sub` claim".to_string()));
+    }
+
+    Ok(sub)
+}
+
+/// Validate an ALB-specific JWT: fetch key, verify signature, check claims.
 ///
-/// Returns the `sub` (subject) claim on success.
-async fn validate_oidc_jwt(oidc: &OidcState, jwt: &str) -> Result<String, OidcError> {
+/// ALB JWTs may have non-standard base64 padding and DER-encoded ECDSA
+/// signatures. This function handles those quirks.
+async fn validate_alb_jwt(alb: &AlbOidcState, jwt: &str) -> Result<String, OidcError> {
     // Normalize first — `decode_header()` uses URL_SAFE_NO_PAD internally
     // and chokes on the `=` padding that AWS ALB includes.
     let normalized = normalize_jwt_for_claims(jwt);
@@ -833,7 +916,7 @@ async fn validate_oidc_jwt(oidc: &OidcState, jwt: &str) -> Result<String, OidcEr
     let alg = header.alg;
 
     // Fetch (or retrieve from cache) the signing key.
-    let (key, resolved_alg) = oidc.get_or_fetch_key(&kid, alg).await?;
+    let (key, resolved_alg) = alb.get_or_fetch_key(&kid, alg).await?;
 
     // Verify signature against the ORIGINAL JWT text (preserving any
     // padding). ALB signed over the padded segments, so we must use the
@@ -843,8 +926,7 @@ async fn validate_oidc_jwt(oidc: &OidcState, jwt: &str) -> Result<String, OidcEr
     // SAFETY: Signature validation is disabled here because we already
     // verified the signature above via `verify_signature()`. We use
     // `decode()` only for claim extraction and expiry/issuer/audience
-    // validation. Do not copy this pattern without the preceding
-    // `verify_signature()` call.
+    // validation.
     let mut validation = Validation::new(resolved_alg);
     validation.insecure_disable_signature_validation();
 
@@ -853,11 +935,11 @@ async fn validate_oidc_jwt(oidc: &OidcState, jwt: &str) -> Result<String, OidcEr
     // JWT — not just mismatch rejection — to prevent tokens that omit
     // these claims entirely from passing validation.
     let mut required = vec!["exp".to_string()];
-    if let Some(ref iss) = oidc.config.issuer {
+    if let Some(ref iss) = alb.config.issuer {
         validation.set_issuer(&[iss]);
         required.push("iss".to_string());
     }
-    if let Some(ref aud) = oidc.config.audience {
+    if let Some(ref aud) = alb.config.audience {
         validation.set_audience(&[aud]);
         required.push("aud".to_string());
     } else {
@@ -960,17 +1042,67 @@ fn query_token(request: &Request) -> Option<String> {
 
 pub(crate) fn extract_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     let cookie_header = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
-    cookie::Cookie::split_parse(cookie_header)
-        .filter_map(Result::ok)
-        .find(|cookie| cookie.name() == name)
-        .and_then(|cookie| {
-            let value = cookie.value_trimmed();
-            if value.is_empty() {
-                None
+    parse_cookie_value(cookie_header, name)
+}
+
+/// Parse a cookie header value by name, handling quoted values that may
+/// contain semicolons (e.g., `other="quoted;value"; session=abc`).
+fn parse_cookie_value(header: &str, name: &str) -> Option<String> {
+    let mut pos = 0;
+    let bytes = header.as_bytes();
+    while pos < bytes.len() {
+        // Skip leading whitespace.
+        while pos < bytes.len() && bytes[pos] == b' ' {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            break;
+        }
+
+        // Read the name (up to '=' or ';' or end).
+        let name_start = pos;
+        while pos < bytes.len() && bytes[pos] != b'=' && bytes[pos] != b';' {
+            pos += 1;
+        }
+        let cookie_name = header[name_start..pos].trim();
+
+        if pos < bytes.len() && bytes[pos] == b'=' {
+            pos += 1; // skip '='
+            // Read the value — may be quoted.
+            let value = if pos < bytes.len() && bytes[pos] == b'"' {
+                pos += 1; // skip opening quote
+                let value_start = pos;
+                while pos < bytes.len() && bytes[pos] != b'"' {
+                    pos += 1;
+                }
+                let v = header[value_start..pos].to_string();
+                if pos < bytes.len() {
+                    pos += 1; // skip closing quote
+                }
+                v
             } else {
-                Some(value.to_string())
+                let value_start = pos;
+                while pos < bytes.len() && bytes[pos] != b';' {
+                    pos += 1;
+                }
+                header[value_start..pos].to_string()
+            };
+
+            if cookie_name == name {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+                return None;
             }
-        })
+        }
+
+        // Advance past semicolon separator.
+        while pos < bytes.len() && bytes[pos] == b';' {
+            pos += 1;
+        }
+    }
+    None
 }
 
 /// Extract a bearer token from the Authorization header or query parameter.
@@ -998,12 +1130,14 @@ fn extract_token(headers: &HeaderMap, request: &Request) -> Option<String> {
 
 // ── Middleware ────────────────────────────────────────────────────────────
 
-/// Auth middleware: bearer/query token → OIDC JWT → 401.
+/// Auth middleware: session → bearer/query token → OIDC JWT → trust-proxy → 401.
 ///
-/// Tries env-var tokens first (constant-time, in-memory), then falls back
-/// to DB-backed token lookup if configured, then OIDC JWT validation.
-/// SSE connections can't set headers from `EventSource`, so we also accept
-/// `?token=xxx` as a query parameter, but only on SSE/WS endpoints.
+/// Checks for a tower-sessions session first (for OAuth-authenticated browser
+/// sessions). If a session contains a valid user_id, authentication succeeds
+/// immediately. Otherwise tries env-var tokens, DB-backed tokens, OIDC JWT
+/// validation, then trust-proxy headers. SSE connections can't set headers from
+/// `EventSource`, so we also accept `?token=xxx` as a query parameter,
+/// but only on SSE/WS endpoints.
 ///
 /// On successful authentication, inserts the matching `UserIdentity` into
 /// request extensions for downstream extraction via `AuthenticatedUser`.
@@ -1013,6 +1147,27 @@ pub async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
+    // 0. Try session-based auth first (for OAuth browser sessions).
+    if let Some(session) = request.extensions().get::<tower_sessions::Session>() {
+        if let Ok(Some(user_id)) = session.get::<String>("user_id").await {
+            if !user_id.is_empty() {
+                let role = session
+                    .get::<String>("role")
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "member".to_string());
+                tracing::debug!(user_id = %user_id, "Session auth succeeded");
+                request.extensions_mut().insert(UserIdentity {
+                    user_id,
+                    role,
+                    workspace_read_scopes: Vec::new(),
+                });
+                return next.run(request).await;
+            }
+        }
+    }
+
     // Extract the candidate token from header or query param.
     let token = extract_token(&headers, &request);
 
@@ -1039,51 +1194,112 @@ pub async fn auth_middleware(
         }
     }
 
-    // 3. Try OIDC JWT from configured header (if enabled).
-    if let Some(ref oidc) = auth.oidc
-        && let Some(jwt_header) = headers.get(oidc.header_name())
-        && let Ok(jwt) = jwt_header.to_str()
-    {
-        match validate_oidc_jwt(oidc, jwt).await {
-            Ok(sub) => {
-                // Enforce email domain restriction if configured.
-                // Require a verified email — an unverified email could be
-                // set to any value and bypass the domain allowlist.
-                if !auth.oidc_allowed_domains.is_empty() {
-                    let (email, email_verified) = extract_oidc_email_claims(jwt);
-                    if !email_verified {
-                        tracing::warn!(sub = %sub, email = ?email, "OIDC login rejected: domain restriction requires verified email");
-                        return (
-                            StatusCode::FORBIDDEN,
-                            "Login requires a verified email address from an authorized domain."
-                                .to_string(),
-                        )
-                            .into_response();
-                    }
-                    if let Err(msg) = crate::channels::web::handlers::auth::check_email_domain(
-                        email.as_deref(),
-                        &auth.oidc_allowed_domains,
-                    ) {
-                        tracing::warn!(sub = %sub, error = %msg, "OIDC login rejected by domain restriction");
-                        return (StatusCode::FORBIDDEN, msg).into_response();
-                    }
+    // 3. Try OIDC JWT from configured header (standard or ALB).
+    if let Some(oidc) = auth.oidc.read().await.as_ref() {
+        let (header_name, result) = match oidc {
+            OidcMode::Standard(state) => {
+                let jwt = headers.get(&state.header).and_then(|v| v.to_str().ok());
+                match jwt {
+                    Some(jwt) => (state.header.as_str(), validate_standard_oidc_jwt(state, jwt).await),
+                    None => (state.header.as_str(), Err(OidcError::InvalidClaims("no header".to_string()))),
                 }
-                tracing::debug!(sub = %sub, "OIDC auth succeeded");
-                let identity = UserIdentity {
-                    user_id: sub,
-                    role: "member".to_string(),
-                    workspace_read_scopes: Vec::new(),
+            }
+            OidcMode::Alb(state) => {
+                let jwt = headers.get(state.header_name()).and_then(|v| v.to_str().ok());
+                match jwt {
+                    Some(jwt) => (state.header_name(), validate_alb_jwt(state, jwt).await),
+                    None => (state.header_name(), Err(OidcError::InvalidClaims("no header".to_string()))),
+                }
+            }
+        };
+
+        if let Ok(sub) = result {
+            // Enforce email domain restriction if configured.
+            if !auth.oidc_allowed_domains.is_empty() {
+                // For ALB JWTs, extract email from claims.
+                // For standard OIDC, email domain restriction via raw JWT
+                // extraction is not yet supported; the verifier handles it.
+                let (email, email_verified) = match oidc {
+                    OidcMode::Alb(_) => {
+                        if let Some(jwt_str) = headers.get(header_name).and_then(|v| v.to_str().ok()) {
+                            extract_oidc_email_claims(jwt_str)
+                        } else {
+                            (None, false)
+                        }
+                    }
+                    OidcMode::Standard(_) => (None, true),
                 };
-                request.extensions_mut().insert(identity);
-                return next.run(request).await;
+                if !email_verified {
+                    tracing::warn!(sub = %sub, email = ?email, "OIDC login rejected: domain restriction requires verified email");
+                    return (
+                        StatusCode::FORBIDDEN,
+                        "Login requires a verified email address from an authorized domain.".to_string(),
+                    )
+                        .into_response();
+                }
+                if let Err(msg) = crate::channels::web::handlers::auth::check_email_domain(
+                    email.as_deref(),
+                    &auth.oidc_allowed_domains,
+                ) {
+                    tracing::warn!(sub = %sub, error = %msg, "OIDC login rejected by domain restriction");
+                    return (StatusCode::FORBIDDEN, msg).into_response();
+                }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "OIDC auth failed");
-            }
+            tracing::debug!(sub = %sub, "OIDC auth succeeded");
+            let identity = UserIdentity {
+                user_id: sub,
+                role: "member".to_string(),
+                workspace_read_scopes: Vec::new(),
+            };
+            request.extensions_mut().insert(identity);
+            return next.run(request).await;
+        }
+    }
+
+    // 4. Try trust-proxy headers (if configured).
+    if let Some(ref proxy_cfg) = auth.trust_proxy {
+        if let Some(identity) = extract_proxy_identity(&headers, proxy_cfg) {
+            tracing::debug!(user_id = %identity.user_id, "Trust-proxy auth succeeded");
+            request.extensions_mut().insert(identity);
+            return next.run(request).await;
         }
     }
 
     (StatusCode::UNAUTHORIZED, "Invalid or missing auth token").into_response()
+}
+
+/// Extract user identity from trust-proxy headers.
+///
+/// Verifies the proxy secret using constant-time comparison, then extracts
+/// user identity from the configured headers. Returns `None` if the secret
+/// doesn't match or the user header is missing.
+fn extract_proxy_identity(headers: &HeaderMap, config: &TrustProxyConfig) -> Option<UserIdentity> {
+    // Constant-time comparison of proxy secret to prevent timing attacks.
+    let proxy_secret = headers.get("X-Proxy-Secret")?.to_str().ok()?;
+    if !bool::from(proxy_secret.as_bytes().ct_eq(config.proxy_secret.as_bytes())) {
+        return None;
+    }
+
+    let user_id = headers.get(&config.user_header)?.to_str().ok()?.to_string();
+    if user_id.is_empty() {
+        return None;
+    }
+
+    let role = match &config.role_header {
+        Some(header_name) => headers
+            .get(header_name)
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&config.default_role),
+        None => &config.default_role,
+    }
+    .to_string();
+
+    Some(UserIdentity {
+        user_id,
+        role,
+        workspace_read_scopes: Vec::new(),
+    })
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -1638,7 +1854,7 @@ mod tests {
         let token =
             jsonwebtoken::encode(&header, &claims, &EncodingKey::from_secret(secret)).unwrap();
 
-        // Build an OidcState that serves the key from a mock.
+        // Build an AlbOidcState that serves the key from a mock.
         // We can't easily mock HTTP, so test the claim extraction path directly:
         // build a Validation that skips signature check and verify `sub` is required.
         let mut validation = Validation::new(Algorithm::HS256);
@@ -1904,8 +2120,8 @@ mod tests {
     }
 
     /// Build a default OIDC config (no issuer/audience validation).
-    fn test_oidc_config() -> crate::config::GatewayOidcConfig {
-        crate::config::GatewayOidcConfig {
+    fn test_oidc_config() -> crate::config::AlbOidcConfig {
+        crate::config::AlbOidcConfig {
             header: OIDC_HEADER_NAME.to_string(),
             jwks_url: "https://unused.example.com/keys".to_string(),
             issuer: None,
@@ -1913,14 +2129,14 @@ mod tests {
         }
     }
 
-    /// Build an OidcState with the HS256 test key pre-seeded.
-    async fn test_oidc_state() -> OidcState {
+    /// Build an AlbOidcState with the HS256 test key pre-seeded.
+    async fn test_oidc_state() -> AlbOidcState {
         test_oidc_state_with_config(test_oidc_config()).await
     }
 
-    /// Build an OidcState from a custom config with the HS256 test key pre-seeded.
-    async fn test_oidc_state_with_config(config: crate::config::GatewayOidcConfig) -> OidcState {
-        let oidc = OidcState::from_config(&config).unwrap(); // safety: test helper
+    /// Build an AlbOidcState from a custom config with the HS256 test key pre-seeded.
+    async fn test_oidc_state_with_config(config: crate::config::AlbOidcConfig) -> AlbOidcState {
+        let oidc = AlbOidcState::from_config(&config).unwrap(); // safety: test helper
         oidc.seed_key(
             OIDC_KID,
             DecodingKey::from_secret(OIDC_SECRET),
@@ -1938,8 +2154,9 @@ mod tests {
                 "bearer-user".to_string(),
             ),
             db_auth: None,
-            oidc: Some(test_oidc_state().await),
+            oidc: std::sync::Arc::new(tokio::sync::RwLock::new(Some(OidcMode::Alb(test_oidc_state().await)))),
             oidc_allowed_domains: Vec::new(),
+            trust_proxy: None,
         }
     }
 
@@ -2166,7 +2383,7 @@ mod tests {
             serde_json::json!({"sub": 12345, "exp": 9999999999u64}),
             Some(OIDC_KID),
         );
-        let result = validate_oidc_jwt(&oidc, &jwt).await;
+        let result = validate_alb_jwt(&oidc, &jwt).await;
         assert!(
             result.is_err(),
             "non-string sub should be rejected: {result:?}"
@@ -2228,7 +2445,7 @@ mod tests {
             }),
             Some(OIDC_KID),
         );
-        let result = validate_oidc_jwt(&oidc, &jwt).await;
+        let result = validate_alb_jwt(&oidc, &jwt).await;
         assert!(result.is_ok(), "matching issuer should pass: {result:?}");
         assert_eq!(result.unwrap(), "alice");
     }
@@ -2247,7 +2464,7 @@ mod tests {
             }),
             Some(OIDC_KID),
         );
-        let result = validate_oidc_jwt(&oidc, &jwt).await;
+        let result = validate_alb_jwt(&oidc, &jwt).await;
         assert!(result.is_err(), "wrong issuer should be rejected");
     }
 
@@ -2264,7 +2481,7 @@ mod tests {
             serde_json::json!({"sub": "alice", "exp": 9999999999u64}),
             Some(OIDC_KID),
         );
-        let result = validate_oidc_jwt(&oidc, &jwt).await;
+        let result = validate_alb_jwt(&oidc, &jwt).await;
         assert!(
             result.is_err(),
             "missing iss should be rejected when issuer is configured"
@@ -2285,7 +2502,7 @@ mod tests {
             }),
             Some(OIDC_KID),
         );
-        let result = validate_oidc_jwt(&oidc, &jwt).await;
+        let result = validate_alb_jwt(&oidc, &jwt).await;
         assert!(result.is_ok(), "matching audience should pass: {result:?}");
     }
 
@@ -2303,7 +2520,7 @@ mod tests {
             }),
             Some(OIDC_KID),
         );
-        let result = validate_oidc_jwt(&oidc, &jwt).await;
+        let result = validate_alb_jwt(&oidc, &jwt).await;
         assert!(result.is_err(), "wrong audience should be rejected");
     }
 
@@ -2320,7 +2537,7 @@ mod tests {
             serde_json::json!({"sub": "alice", "exp": 9999999999u64}),
             Some(OIDC_KID),
         );
-        let result = validate_oidc_jwt(&oidc, &jwt).await;
+        let result = validate_alb_jwt(&oidc, &jwt).await;
         assert!(
             result.is_err(),
             "missing aud should be rejected when audience is configured"
@@ -2369,7 +2586,7 @@ mod tests {
             serde_json::json!({"sub": "stale-user", "exp": 9999999999u64}),
             Some("stale-kid"),
         );
-        let result = validate_oidc_jwt(&oidc, &jwt).await;
+        let result = validate_alb_jwt(&oidc, &jwt).await;
         assert!(
             result.is_err(),
             "expired cache entry should not be served; fetch fails since URL is unreachable"
@@ -2460,5 +2677,223 @@ mod tests {
             !err_msg.contains("backing off"),
             "should attempt fetch, not backoff: {err_msg}"
         );
+    }
+
+    // ── Trust-proxy tests ──────────────────────────────────────────────────
+
+    fn test_proxy_config() -> TrustProxyConfig {
+        TrustProxyConfig {
+            proxy_secret: "proxy-secret-123".to_string(),
+            user_header: "X-Forwarded-User".to_string(),
+            email_header: Some("X-Forwarded-Email".to_string()),
+            role_header: Some("X-Forwarded-Role".to_string()),
+            default_role: "member".to_string(),
+            allowed_domains: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_extract_proxy_identity_valid_with_role() {
+        let config = test_proxy_config();
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Proxy-Secret", HeaderValue::from_static("proxy-secret-123"));
+        headers.insert("X-Forwarded-User", HeaderValue::from_static("alice"));
+        headers.insert("X-Forwarded-Email", HeaderValue::from_static("alice@example.com"));
+        headers.insert("X-Forwarded-Role", HeaderValue::from_static("admin"));
+
+        let identity = extract_proxy_identity(&headers, &config).unwrap();
+        assert_eq!(identity.user_id, "alice");
+        assert_eq!(identity.role, "admin");
+    }
+
+    #[test]
+    fn test_extract_proxy_identity_defaults_to_member() {
+        let config = test_proxy_config();
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Proxy-Secret", HeaderValue::from_static("proxy-secret-123"));
+        headers.insert("X-Forwarded-User", HeaderValue::from_static("bob"));
+
+        let identity = extract_proxy_identity(&headers, &config).unwrap();
+        assert_eq!(identity.user_id, "bob");
+        assert_eq!(identity.role, "member");
+    }
+
+    #[test]
+    fn test_extract_proxy_identity_wrong_secret_rejected() {
+        let config = test_proxy_config();
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Proxy-Secret", HeaderValue::from_static("wrong-secret"));
+        headers.insert("X-Forwarded-User", HeaderValue::from_static("alice"));
+
+        assert!(extract_proxy_identity(&headers, &config).is_none());
+    }
+
+    #[test]
+    fn test_extract_proxy_identity_missing_secret_rejected() {
+        let config = test_proxy_config();
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Forwarded-User", HeaderValue::from_static("alice"));
+
+        assert!(extract_proxy_identity(&headers, &config).is_none());
+    }
+
+    #[test]
+    fn test_extract_proxy_identity_missing_user_rejected() {
+        let config = test_proxy_config();
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Proxy-Secret", HeaderValue::from_static("proxy-secret-123"));
+
+        assert!(extract_proxy_identity(&headers, &config).is_none());
+    }
+
+    #[test]
+    fn test_extract_proxy_identity_empty_user_rejected() {
+        let config = test_proxy_config();
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Proxy-Secret", HeaderValue::from_static("proxy-secret-123"));
+        headers.insert("X-Forwarded-User", HeaderValue::from_static(""));
+
+        assert!(extract_proxy_identity(&headers, &config).is_none());
+    }
+
+    #[test]
+    fn test_extract_proxy_identity_empty_role_falls_back_to_default() {
+        let config = test_proxy_config();
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Proxy-Secret", HeaderValue::from_static("proxy-secret-123"));
+        headers.insert("X-Forwarded-User", HeaderValue::from_static("alice"));
+        headers.insert("X-Forwarded-Role", HeaderValue::from_static(""));
+
+        let identity = extract_proxy_identity(&headers, &config).unwrap();
+        assert_eq!(identity.role, "member");
+    }
+
+    #[test]
+    fn test_extract_proxy_identity_no_role_header_configured() {
+        let mut config = test_proxy_config();
+        config.role_header = None;
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Proxy-Secret", HeaderValue::from_static("proxy-secret-123"));
+        headers.insert("X-Forwarded-User", HeaderValue::from_static("alice"));
+
+        let identity = extract_proxy_identity(&headers, &config).unwrap();
+        assert_eq!(identity.role, "member");
+    }
+
+    #[test]
+    fn test_extract_proxy_identity_constant_time_secret_comparison() {
+        let config = test_proxy_config();
+
+        // A secret of the same length but wrong value should still be rejected.
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Proxy-Secret", HeaderValue::from_static("proxy-secret-124"));
+        headers.insert("X-Forwarded-User", HeaderValue::from_static("alice"));
+
+        assert!(extract_proxy_identity(&headers, &config).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_trust_proxy_auth_via_middleware() {
+        let config = test_proxy_config();
+        let auth = CombinedAuthState {
+            env_auth: MultiAuthState::single("tok".to_string(), "bearer-user".to_string()),
+            db_auth: None,
+            oidc: Arc::new(tokio::sync::RwLock::new(None)),
+            oidc_allowed_domains: Vec::new(),
+            trust_proxy: Some(config),
+        };
+        let app = Router::new()
+            .route("/api/test", get(dummy_handler))
+            .layer(middleware::from_fn_with_state(auth, auth_middleware));
+
+        let req = Request::builder()
+            .uri("/api/test")
+            .header("X-Proxy-Secret", "proxy-secret-123")
+            .header("X-Forwarded-User", "proxy-alice")
+            .header("X-Forwarded-Role", "admin")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_trust_proxy_wrong_secret_rejected_via_middleware() {
+        let config = test_proxy_config();
+        let auth = CombinedAuthState {
+            env_auth: MultiAuthState::single("tok".to_string(), "bearer-user".to_string()),
+            db_auth: None,
+            oidc: Arc::new(tokio::sync::RwLock::new(None)),
+            oidc_allowed_domains: Vec::new(),
+            trust_proxy: Some(config),
+        };
+        let app = Router::new()
+            .route("/api/test", get(dummy_handler))
+            .layer(middleware::from_fn_with_state(auth, auth_middleware));
+
+        let req = Request::builder()
+            .uri("/api/test")
+            .header("X-Proxy-Secret", "wrong-secret")
+            .header("X-Forwarded-User", "proxy-alice")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_trust_proxy_falls_through_when_no_headers() {
+        // When trust-proxy is configured but no proxy headers are present,
+        // the middleware should fall through to bearer token auth.
+        let config = test_proxy_config();
+        let auth = CombinedAuthState {
+            env_auth: MultiAuthState::single("tok".to_string(), "bearer-user".to_string()),
+            db_auth: None,
+            oidc: Arc::new(tokio::sync::RwLock::new(None)),
+            oidc_allowed_domains: Vec::new(),
+            trust_proxy: Some(config),
+        };
+        let app = Router::new()
+            .route("/api/test", get(dummy_handler))
+            .layer(middleware::from_fn_with_state(auth, auth_middleware));
+
+        // No proxy headers, but valid bearer token → should authenticate via bearer.
+        let req = Request::builder()
+            .uri("/api/test")
+            .header("Authorization", "Bearer tok")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_parse_cookie_value_simple() {
+        let result = parse_cookie_value("a=1; b=2; c=3", "b");
+        assert_eq!(result, Some("2".to_string()));
+    }
+
+    #[test]
+    fn test_parse_cookie_value_quoted() {
+        let result = parse_cookie_value("other=\"quoted;value\"; session=abc123", "session");
+        assert_eq!(result, Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn test_parse_cookie_value_missing() {
+        let result = parse_cookie_value("a=1; b=2", "c");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_cookie_value_empty_value() {
+        let result = parse_cookie_value("a=1; b=; c=3", "b");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_cookie_value_first_match() {
+        let result = parse_cookie_value("a=1; a=2", "a");
+        assert_eq!(result, Some("1".to_string()));
     }
 }

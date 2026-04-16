@@ -65,26 +65,84 @@ pub struct GatewayConfig {
     pub workspace_read_scopes: Vec<String>,
     /// Memory layer definitions (JSON in env var, or from external config).
     pub memory_layers: Vec<crate::workspace::layer::MemoryLayer>,
-    /// OIDC JWT authentication (e.g., behind AWS ALB with Okta).
-    pub oidc: Option<GatewayOidcConfig>,
+    /// OIDC JWT authentication (ALB mode or standard OIDC discovery).
+    pub oidc: Option<OidcConfig>,
+    /// Trust-proxy authentication (trusts headers from a reverse proxy).
+    pub trust_proxy: Option<TrustProxyConfig>,
 }
 
-/// OIDC JWT authentication configuration for the web gateway.
+/// OIDC authentication mode for the web gateway.
 ///
-/// When enabled, the gateway accepts signed JWTs from a configurable HTTP
-/// header (e.g., `x-amzn-oidc-data` from AWS ALB). Keys are fetched from
-/// a JWKS endpoint and cached for 1 hour.
+/// `Alb` mode handles non-standard JWTs from AWS ALB (padded base64, DER-encoded
+/// ECDSA signatures, per-key URL fetching via `{kid}` placeholder).
+///
+/// `Standard` mode uses the `openidconnect` crate for full OIDC discovery,
+/// JWKS key rotation, and standard JWT verification.
 #[derive(Debug, Clone)]
-pub struct GatewayOidcConfig {
+pub enum OidcConfig {
+    /// AWS ALB mode: accepts JWTs from `x-amzn-oidc-data` header with
+    /// ALB-specific base64 and DER handling.
+    Alb(AlbOidcConfig),
+    /// Standard OIDC mode: discovers provider metadata and verifies JWTs
+    /// using the `openidconnect` crate. Works with Okta, Auth0, Keycloak,
+    /// Cognito, Azure AD, Google, and other standard providers.
+    Standard(StandardOidcConfig),
+}
+
+/// ALB-specific OIDC configuration.
+///
+/// Handles non-standard JWTs produced by AWS Application Load Balancer:
+/// padded base64 segments, DER-encoded ECDSA signatures, and per-key
+/// PEM endpoints via `{kid}` URL placeholder.
+#[derive(Debug, Clone)]
+pub struct AlbOidcConfig {
     /// HTTP header containing the JWT (default: `x-amzn-oidc-data`).
     pub header: String,
     /// JWKS URL for key discovery. Supports `{kid}` placeholder for
-    /// ALB-style per-key PEM endpoints, and standard `/.well-known/jwks.json`.
+    /// ALB-style per-key PEM endpoints.
     pub jwks_url: String,
     /// Expected `iss` claim. Validated if set.
     pub issuer: Option<String>,
     /// Expected `aud` claim. Validated if set.
     pub audience: Option<String>,
+}
+
+/// Standard OIDC configuration.
+///
+/// Uses the `openidconnect` crate for full provider discovery, automatic
+/// JWKS key rotation, and standard JWT verification.
+#[derive(Debug, Clone)]
+pub struct StandardOidcConfig {
+    /// OIDC issuer URL (e.g. `https://accounts.google.com`).
+    /// Used for discovery: `/.well-known/openid-configuration`.
+    pub issuer: String,
+    /// Client ID (audience) for the application.
+    pub client_id: String,
+    /// HTTP header containing the JWT (default: `Authorization` with Bearer prefix).
+    pub header: String,
+}
+
+/// Trust-proxy authentication configuration.
+///
+/// When enabled, the gateway trusts authenticated headers from a reverse
+/// proxy (e.g., oauth2-proxy, nginx, ALB + Lambda@Edge). The proxy must
+/// set `X-Proxy-Secret` to prevent header spoofing from untrusted sources.
+#[derive(Debug, Clone)]
+pub struct TrustProxyConfig {
+    /// Shared secret that the proxy must send in the `X-Proxy-Secret` header.
+    /// Compared using constant-time comparison to prevent timing attacks.
+    pub proxy_secret: String,
+    /// Header containing the authenticated user ID (e.g., `X-Forwarded-User`).
+    pub user_header: String,
+    /// Optional header containing the user's email address.
+    pub email_header: Option<String>,
+    /// Optional header containing the user's role (`admin` or `member`).
+    /// If absent, defaults to `default_role`.
+    pub role_header: Option<String>,
+    /// Default role when `role_header` is absent or empty (default: `member`).
+    pub default_role: String,
+    /// Email domains allowed for proxy-authenticated users. Empty means allow all.
+    pub allowed_domains: Vec<String>,
 }
 
 /// Signal channel configuration (signal-cli daemon HTTP/JSON-RPC).
@@ -243,17 +301,71 @@ impl ChannelsConfig {
             }
             let oidc_enabled = parse_bool_env("GATEWAY_OIDC_ENABLED", false)?;
             let oidc = if oidc_enabled {
-                let jwks_url =
-                    optional_env("GATEWAY_OIDC_JWKS_URL")?.ok_or(ConfigError::InvalidValue {
-                        key: "GATEWAY_OIDC_JWKS_URL".to_string(),
-                        message: "required when GATEWAY_OIDC_ENABLED=true".to_string(),
-                    })?;
-                Some(GatewayOidcConfig {
-                    header: optional_env("GATEWAY_OIDC_HEADER")?
-                        .unwrap_or_else(|| "x-amzn-oidc-data".to_string()),
-                    jwks_url,
-                    issuer: optional_env("GATEWAY_OIDC_ISSUER")?,
-                    audience: optional_env("GATEWAY_OIDC_AUDIENCE")?,
+                // Standard OIDC: uses issuer URL for discovery (no {kid} placeholder).
+                // ALB mode: uses JWKS URL with optional {kid} placeholder.
+                let jwks_url = optional_env("GATEWAY_OIDC_JWKS_URL")?;
+                let issuer_env = optional_env("GATEWAY_OIDC_ISSUER")?;
+                let client_id = optional_env("GATEWAY_OIDC_CLIENT_ID")?;
+
+                if let Some(issuer) = issuer_env {
+                    // Standard OIDC mode: issuer URL for discovery.
+                    let client_id_val = client_id.unwrap_or_default();
+                    if client_id_val.is_empty() {
+                        return Err(ConfigError::InvalidValue {
+                            key: "GATEWAY_OIDC_CLIENT_ID".to_string(),
+                            message: "required when GATEWAY_OIDC_ISSUER is set (standard OIDC mode)".to_string(),
+                        });
+                    }
+                    Some(OidcConfig::Standard(StandardOidcConfig {
+                        issuer,
+                        client_id: client_id_val,
+                        header: optional_env("GATEWAY_OIDC_HEADER")?
+                            .unwrap_or_else(|| "Authorization".to_string()),
+                    }))
+                } else if let Some(jwks) = jwks_url {
+                    // ALB mode: JWKS URL (with optional {kid} placeholder).
+                    Some(OidcConfig::Alb(AlbOidcConfig {
+                        header: optional_env("GATEWAY_OIDC_HEADER")?
+                            .unwrap_or_else(|| "x-amzn-oidc-data".to_string()),
+                        jwks_url: jwks,
+                        issuer: optional_env("GATEWAY_OIDC_ISSUER")?,
+                        audience: optional_env("GATEWAY_OIDC_AUDIENCE")?,
+                    }))
+                } else {
+                    return Err(ConfigError::InvalidValue {
+                        key: "GATEWAY_OIDC_ENABLED".to_string(),
+                        message: "OIDC enabled but neither GATEWAY_OIDC_ISSUER (standard) nor GATEWAY_OIDC_JWKS_URL (ALB) is set".to_string(),
+                    });
+                }
+            } else {
+                None
+            };
+
+            let trust_proxy = if let Some(secret) =
+                optional_env("GATEWAY_PROXY_SECRET")?
+            {
+                if secret.is_empty() {
+                    return Err(ConfigError::InvalidValue {
+                        key: "GATEWAY_PROXY_SECRET".to_string(),
+                        message: "must not be empty".to_string(),
+                    });
+                }
+                Some(TrustProxyConfig {
+                    proxy_secret: secret,
+                    user_header: optional_env("GATEWAY_PROXY_USER_HEADER")?
+                        .unwrap_or_else(|| "X-Forwarded-User".to_string()),
+                    email_header: optional_env("GATEWAY_PROXY_EMAIL_HEADER")?,
+                    role_header: optional_env("GATEWAY_PROXY_ROLE_HEADER")?,
+                    default_role: optional_env("GATEWAY_PROXY_DEFAULT_ROLE")?
+                        .unwrap_or_else(|| "member".to_string()),
+                    allowed_domains: optional_env("GATEWAY_PROXY_ALLOWED_DOMAINS")?
+                        .map(|s| {
+                            s.split(',')
+                                .map(|d| d.trim().to_string())
+                                .filter(|d| !d.is_empty())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 })
             } else {
                 None
@@ -294,6 +406,7 @@ impl ChannelsConfig {
                 workspace_read_scopes,
                 memory_layers,
                 oidc,
+                trust_proxy,
             })
         } else {
             None
@@ -481,6 +594,7 @@ mod tests {
             workspace_read_scopes: vec![],
             memory_layers: vec![],
             oidc: None,
+            trust_proxy: None,
         };
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, 3000);
@@ -497,6 +611,7 @@ mod tests {
             workspace_read_scopes: vec![],
             memory_layers: vec![],
             oidc: None,
+            trust_proxy: None,
         };
         assert!(cfg.auth_token.is_none());
     }

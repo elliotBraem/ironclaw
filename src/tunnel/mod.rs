@@ -432,6 +432,7 @@ mod tests {
             max_connections: 100,
             workspace_read_scopes: Vec::new(),
             oidc: None,
+            trust_proxy: None,
             memory_layers: Vec::new(),
         });
         c
@@ -447,6 +448,7 @@ mod tests {
             workspace_read_scopes: Vec::new(),
             memory_layers: Vec::new(),
             oidc: None,
+            trust_proxy: None,
         });
         c
     }

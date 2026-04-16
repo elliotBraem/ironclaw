@@ -479,18 +479,20 @@ pub struct GatewayState {
     /// When this sender is dropped, the sweep loops exit gracefully.
     #[allow(dead_code)]
     pub oauth_sweep_shutdown: Option<tokio::sync::watch::Sender<()>>,
-    /// Cache for the assembled frontend HTML served from `/`.
-    ///
+/// Cache for the assembled frontend HTML served from `/`.
+///
     /// The cache key is derived from the `updated_at` of
     /// `.system/gateway/layout.json` and the `.system/gateway/widgets/`
-    /// directory — both returned by a single cheap `list(".system/gateway/")`
-    /// call. A hit skips reading the layout, every widget manifest, every
+    /// directory — both returned by a single cheap `list()` call.
+    /// A hit skips reading the layout, every widget manifest, every
     /// widget JS file, and every widget CSS file. A miss (or absent cache)
     /// falls through to the full `build_frontend_html()` path.
     pub frontend_html_cache: Arc<tokio::sync::RwLock<Option<FrontendHtmlCache>>>,
     /// Channel-agnostic tool dispatcher for routing handler operations through
     /// the tool pipeline with audit trail.
     pub tool_dispatcher: Option<Arc<crate::tools::dispatch::ToolDispatcher>>,
+    /// Tower-sessions memory store for OAuth/browser session management.
+    pub session_store: tower_sessions::MemoryStore,
 }
 
 /// Cached result of `build_frontend_html()`, keyed by a cheap workspace
@@ -929,6 +931,19 @@ pub async fn start_server(
             header::HeaderName::from_static("content-security-policy"),
             BASE_CSP_HEADER.clone(),
         ))
+        // Session layer: provides tower-sessions session support for
+        // OAuth/auth browser flows. Uses the same cookie name ("ironclaw_session")
+        // that was previously managed by hand-rolled Set-Cookie headers.
+        .layer(
+            tower_sessions::SessionManagerLayer::new(state.session_store.clone())
+                .with_name(crate::channels::web::auth::SESSION_COOKIE_NAME)
+                .with_same_site(tower_sessions::cookie::SameSite::Lax)
+                .with_http_only(true)
+                .with_path("/")
+                .with_expiry(tower_sessions::Expiry::OnInactivity(
+                    time::Duration::seconds(crate::channels::web::auth::SESSION_LIFETIME_SECS),
+                )),
+        )
         .with_state(state.clone());
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -4062,6 +4077,7 @@ mod tests {
             oauth_sweep_shutdown: None,
             frontend_html_cache: Arc::new(tokio::sync::RwLock::new(None)),
             tool_dispatcher: None,
+            session_store: tower_sessions::MemoryStore::default(),
         })
     }
 

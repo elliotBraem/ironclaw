@@ -8,7 +8,7 @@ use std::sync::Arc;
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::{HeaderValue, StatusCode, header},
+    http::StatusCode,
     response::{IntoResponse, Redirect, Response},
 };
 use base64::Engine;
@@ -20,9 +20,7 @@ use crate::channels::web::oauth::state_store::{OAuthStateStore, new_oauth_flow};
 use crate::channels::web::server::GatewayState;
 use crate::db::{UserIdentityRecord, UserRecord};
 
-use crate::channels::web::auth::SESSION_COOKIE_NAME;
-/// Session lifetime: 30 days (cookie Max-Age and token expiry).
-const SESSION_LIFETIME_SECS: i64 = 30 * 24 * 60 * 60;
+use crate::channels::web::auth::SESSION_LIFETIME_SECS;
 
 /// Query parameters for the login redirect.
 #[derive(serde::Deserialize)]
@@ -104,20 +102,22 @@ pub async fn login_handler(
 pub async fn callback_handler(
     State(state): State<Arc<GatewayState>>,
     Path(provider_name): Path<String>,
+    session: tower_sessions::Session,
     headers: axum::http::HeaderMap,
     Query(params): Query<CallbackParams>,
 ) -> Response {
-    handle_callback(state, provider_name, params, &headers).await
+    handle_callback(state, provider_name, params, &headers, &session).await
 }
 
 /// POST /auth/callback/{provider} — OAuth callback (form post, used by Apple Sign In).
 pub async fn callback_post_handler(
     State(state): State<Arc<GatewayState>>,
     Path(provider_name): Path<String>,
+    session: tower_sessions::Session,
     headers: axum::http::HeaderMap,
     axum::Form(params): axum::Form<CallbackParams>,
 ) -> Response {
-    handle_callback(state, provider_name, params, &headers).await
+    handle_callback(state, provider_name, params, &headers, &session).await
 }
 
 /// Shared callback logic for both GET (query) and POST (form) callbacks.
@@ -126,6 +126,7 @@ async fn handle_callback(
     provider_name: String,
     params: CallbackParams,
     headers: &axum::http::HeaderMap,
+    session: &tower_sessions::Session,
 ) -> Response {
     if !state.oauth_rate_limiter.check(&rate_limit_key(headers)) {
         return error_page("Too many requests. Please try again later.");
@@ -295,47 +296,22 @@ async fn handle_callback(
         .filter(|u| crate::channels::web::oauth::state_store::is_safe_redirect(u))
         .unwrap_or("/");
 
-    // Build the response with a session cookie.
+    // Store user identity in the tower-sessions session.
+    // The session middleware handles the Set-Cookie header automatically.
+    let _ = session.insert("user_id", user_id.clone()).await;
+    let _ = session.insert("role", "member").await;
+
     // Use 303 See Other (not 307 Temporary) so POST callbacks (Apple form_post)
     // are converted to GET on redirect, preventing the browser from re-POSTing.
-    let cookie_value = build_session_cookie(&plaintext_token, is_secure(base_url));
-    let mut response = Redirect::to(redirect_to).into_response();
-    if let Ok(hv) = HeaderValue::from_str(&cookie_value) {
-        response.headers_mut().insert(header::SET_COOKIE, hv);
-    }
-
-    response
+    Redirect::to(redirect_to).into_response()
 }
 
-/// POST /auth/logout — revoke session token and clear cookie.
+/// POST /auth/logout — destroy session.
 pub async fn logout_handler(
-    State(state): State<Arc<GatewayState>>,
-    headers: axum::http::HeaderMap,
+    session: tower_sessions::Session,
 ) -> Response {
-    // Try to revoke the API token backing this session.
-    if let Some(token) = extract_session_cookie(&headers)
-        && let Some(ref store) = state.store
-    {
-        let token_hash = crate::channels::web::auth::hash_token(&token);
-        if let Ok(Some((record, user))) = store.authenticate_token(&token_hash).await {
-            let _ = store.revoke_api_token(record.id, &user.id).await;
-            if let Some(ref db_auth) = state.db_auth {
-                db_auth.invalidate_user(&user.id).await;
-            }
-        }
-    }
-
-    let secure = state
-        .oauth_base_url
-        .as_deref()
-        .map(is_secure)
-        .unwrap_or(false);
-    let cookie = build_session_cookie_clear(secure);
-    let mut response = (StatusCode::OK, "Logged out").into_response();
-    if let Ok(hv) = HeaderValue::from_str(&cookie) {
-        response.headers_mut().insert(header::SET_COOKIE, hv);
-    }
-    response
+    let _ = session.delete().await;
+    (StatusCode::OK, "Logged out").into_response()
 }
 
 // ── NEAR wallet auth ─────────────────────────────────────────────────────
@@ -376,6 +352,7 @@ pub struct NearVerifyRequest {
 /// POST /auth/near/verify — verify NEAR wallet signature and issue session.
 pub async fn near_verify_handler(
     State(state): State<Arc<GatewayState>>,
+    session: tower_sessions::Session,
     headers: axum::http::HeaderMap,
     Json(body): Json<NearVerifyRequest>,
 ) -> Response {
@@ -567,22 +544,16 @@ pub async fn near_verify_handler(
         db_auth.invalidate_user(&user_id).await;
     }
 
-    // Set session cookie (consistent with OAuth flow) and return user info.
-    let base_url = state
-        .oauth_base_url
-        .as_deref()
-        .unwrap_or("http://localhost");
-    let cookie_value = build_session_cookie(&plaintext_token, is_secure(base_url));
-    let mut response = Json(serde_json::json!({
+    // Store user identity in the session.
+    let _ = session.insert("user_id", user_id.clone()).await;
+    let _ = session.insert("role", "member").await;
+
+    Json(serde_json::json!({
         "user_id": user_id,
         "account_id": body.account_id,
         "is_new": is_new,
     }))
-    .into_response();
-    if let Ok(hv) = HeaderValue::from_str(&cookie_value) {
-        response.headers_mut().insert(header::SET_COOKIE, hv);
-    }
-    response
+    .into_response()
 }
 
 /// Truncate a string safely for error messages (no byte-index panic on multibyte).
@@ -640,11 +611,6 @@ fn decode_near_signature(sig: &str) -> Result<[u8; 64], String> {
         "Invalid signature (expected 64 bytes base64/base58, got: {}...)",
         safe_truncate(sig, 20)
     ))
-}
-
-/// Extract the session cookie value from request headers.
-fn extract_session_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
-    crate::channels::web::auth::extract_cookie_value(headers, SESSION_COOKIE_NAME)
 }
 
 // ── User resolution ──────────────────────────────────────────────────────
@@ -787,22 +753,6 @@ fn build_identity_record(
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-fn build_session_cookie(token: &str, secure: bool) -> String {
-    let secure_flag = if secure { "; Secure" } else { "" };
-    format!(
-        "{SESSION_COOKIE_NAME}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={SESSION_LIFETIME_SECS}{secure_flag}"
-    )
-}
-
-fn build_session_cookie_clear(secure: bool) -> String {
-    let secure_flag = if secure { "; Secure" } else { "" };
-    format!("{SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure_flag}")
-}
-
-fn is_secure(base_url: &str) -> bool {
-    base_url.starts_with("https://")
-}
-
 /// Extract a rate-limit key from request headers (X-Forwarded-For or fallback).
 fn rate_limit_key(headers: &axum::http::HeaderMap) -> String {
     crate::channels::web::server::rate_limit_key_from_headers(headers)
@@ -902,7 +852,13 @@ mod tests {
             HeaderValue::from_static("other=\"quoted;value\"; ironclaw_session=abc123"),
         );
 
-        assert_eq!(extract_session_cookie(&headers), Some("abc123".to_string()));
+        assert_eq!(
+            crate::channels::web::auth::extract_cookie_value(
+                &headers,
+                crate::channels::web::auth::SESSION_COOKIE_NAME
+            ),
+            Some("abc123".to_string())
+        );
     }
 
     #[test]

@@ -95,6 +95,7 @@ fn build_state(
         oauth_sweep_shutdown: None,
         frontend_html_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
         tool_dispatcher: None,
+        session_store: tower_sessions::MemoryStore::default(),
     })
 }
 
@@ -987,6 +988,7 @@ mod admin_tool_policy {
             auth_manager: None,
             frontend_html_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             tool_dispatcher: None,
+            session_store: tower_sessions::MemoryStore::default(),
         })
     }
 

@@ -45,7 +45,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::agent::SessionManager;
 use crate::channels::{Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate};
-use crate::config::GatewayConfig;
+use crate::config::{GatewayConfig, OidcConfig};
 use crate::db::Database;
 use crate::error::ChannelError;
 use crate::extensions::ExtensionManager;
@@ -108,28 +108,36 @@ impl GatewayChannel {
             bytes.iter().map(|b| format!("{b:02x}")).collect()
         });
 
-        let oidc_state = config.oidc.as_ref().and_then(|oidc_config| {
-            match auth::OidcState::from_config(oidc_config) {
-                Ok(state) => {
-                    tracing::info!(
-                        header = %oidc_config.header,
-                        jwks_url = %oidc_config.jwks_url,
-                        "OIDC JWT authentication enabled"
-                    );
-                    Some(state)
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to initialize OIDC auth — falling back to token-only auth");
-                    None
+        let oidc_state = match config.oidc.as_ref() {
+            Some(OidcConfig::Alb(alb_config)) => {
+                match auth::AlbOidcState::from_config(alb_config) {
+                    Ok(state) => {
+                        tracing::info!(
+                            header = %alb_config.header,
+                            jwks_url = %alb_config.jwks_url,
+                            "OIDC JWT authentication enabled (ALB mode)"
+                        );
+                        Some(auth::OidcMode::Alb(state))
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to initialize ALB OIDC auth — falling back to token-only auth");
+                        None
+                    }
                 }
             }
-        });
+            Some(OidcConfig::Standard(_)) => {
+                // Standard OIDC requires async discovery; initialized in start().
+                None
+            }
+            None => None,
+        };
 
         let auth = CombinedAuthState {
             env_auth: MultiAuthState::single(auth_token, owner_id.clone()),
             db_auth: None,
-            oidc: oidc_state,
+            oidc: std::sync::Arc::new(tokio::sync::RwLock::new(oidc_state)),
             oidc_allowed_domains: Vec::new(),
+            trust_proxy: config.trust_proxy.clone(),
         };
 
         let state = Arc::new(GatewayState {
@@ -174,6 +182,7 @@ impl GatewayChannel {
             oauth_sweep_shutdown: None,
             frontend_html_cache: Arc::new(tokio::sync::RwLock::new(None)),
             tool_dispatcher: None,
+            session_store: tower_sessions::MemoryStore::default(),
         });
 
         Self {
@@ -233,6 +242,7 @@ impl GatewayChannel {
             // just because a `with_*` builder added a new subsystem.
             frontend_html_cache: Arc::clone(&self.state.frontend_html_cache),
             tool_dispatcher: self.state.tool_dispatcher.clone(),
+            session_store: self.state.session_store.clone(),
         };
         mutate(&mut new_state);
         new_state.auth_manager = build_gateway_auth_manager(&new_state);
@@ -542,6 +552,25 @@ impl Channel for GatewayChannel {
     }
 
     async fn start(&self) -> Result<MessageStream, ChannelError> {
+        // Initialize standard OIDC discovery (async) if configured.
+        if self.auth.oidc.read().await.is_none() {
+            if let Some(OidcConfig::Standard(std_config)) = self.config.oidc.as_ref() {
+                match auth::StandardOidcState::from_config(std_config).await {
+                    Ok(state) => {
+                        tracing::info!(
+                            issuer = %std_config.issuer,
+                            client_id = %std_config.client_id,
+                            "OIDC JWT authentication enabled (standard mode)"
+                        );
+                        *self.auth.oidc.write().await = Some(auth::OidcMode::Standard(state));
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to initialize standard OIDC auth — falling back to token-only auth");
+                    }
+                }
+            }
+        }
+
         let (tx, rx) = mpsc::channel(256);
         *self.state.msg_tx.write().await = Some(tx);
 
